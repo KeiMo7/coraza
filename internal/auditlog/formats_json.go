@@ -32,6 +32,7 @@ func (legacyJSONFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 		Transaction: logLegacyTransaction{
 			Time:          al.Transaction().Timestamp(),
 			TransactionID: al.Transaction().ID(),
+			ReleaseID:     auditReleaseID(al),
 			RemoteAddress: al.Transaction().ClientIP(),
 			RemotePort:    al.Transaction().ClientPort(),
 			LocalAddress:  al.Transaction().HostIP(),
@@ -85,6 +86,12 @@ func (legacyJSONFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 		for _, m := range al.Messages() {
 			al2.AuditData.Messages = append(al2.AuditData.Messages, m.Message())
 		}
+	}
+	if rel := auditReleaseID(al); rel != "" {
+		if al2.AuditData == nil {
+			al2.AuditData = &logLegacyData{}
+		}
+		al2.AuditData.ReleaseID = rel
 	}
 
 	jsdata, err := json.Marshal(al2)

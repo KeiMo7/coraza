@@ -66,10 +66,14 @@ func (nativeFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 		case types.AuditLogPartHeader:
 			// Part A: Audit log header containing only the timestamp and transaction info line
 			// Note: Part A does not have an empty line separator after it
-			_, _ = fmt.Fprintf(&res, "[%s] %s %s %d %s %d\n",
+			_, _ = fmt.Fprintf(&res, "[%s] %s %s %d %s %d",
 				al.Transaction().Timestamp(), logEscaper.Replace(al.Transaction().ID()),
 				logEscaper.Replace(al.Transaction().ClientIP()), al.Transaction().ClientPort(),
 				logEscaper.Replace(al.Transaction().HostIP()), al.Transaction().HostPort())
+			if rel := auditReleaseID(al); rel != "" {
+				_, _ = fmt.Fprintf(&res, " [release %q]", rel)
+			}
+			res.WriteByte('\n')
 			addSeparator = false
 		case types.AuditLogPartRequestHeaders:
 			// Part B: Request headers
@@ -138,6 +142,11 @@ func (nativeFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 					res.WriteByte('\n')
 				}
 			}
+			if rel := auditReleaseID(al); rel != "" {
+				res.WriteString("Coraza: Audit release ")
+				res.WriteString(logEscaper.Replace(rel))
+				res.WriteByte('\n')
+			}
 		case types.AuditLogPartUploadedFiles:
 			// Part J: Uploaded files information
 			// Format matches ModSecurity v2: index,size,"filename","content_type"
@@ -162,6 +171,11 @@ func (nativeFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 			for _, alEntry := range al.Messages() {
 				res.WriteString(logEscaper.Replace(alEntry.Data().Raw()))
 				res.WriteByte('\n')
+				if rel := auditMessageReleaseID(al, alEntry); rel != "" {
+					res.WriteString("Release-Id: ")
+					res.WriteString(logEscaper.Replace(rel))
+					res.WriteByte('\n')
+				}
 			}
 		case types.AuditLogPartEndMarker:
 			// Part Z: Final boundary marker with no content
@@ -186,3 +200,29 @@ func (nativeFormatter) MIME() string {
 var (
 	_ plugintypes.AuditLogFormatter = (*nativeFormatter)(nil)
 )
+
+type releaseIDProvider interface {
+	ReleaseID() string
+}
+
+func auditReleaseID(al plugintypes.AuditLog) string {
+	if p, ok := al.(releaseIDProvider); ok {
+		return p.ReleaseID()
+	}
+	if p, ok := al.Transaction().(releaseIDProvider); ok {
+		return p.ReleaseID()
+	}
+	return ""
+}
+
+func auditMessageReleaseID(al plugintypes.AuditLog, msg plugintypes.AuditLogMessage) string {
+	if p, ok := msg.(releaseIDProvider); ok && p.ReleaseID() != "" {
+		return p.ReleaseID()
+	}
+	if d := msg.Data(); d != nil {
+		if p, ok := d.(releaseIDProvider); ok && p.ReleaseID() != "" {
+			return p.ReleaseID()
+		}
+	}
+	return auditReleaseID(al)
+}

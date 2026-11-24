@@ -27,6 +27,7 @@ type logLegacyTransaction struct {
 	// Time format 03/Dec/2021:01:13:44.468137 +0000
 	Time          string `json:"time"`
 	TransactionID string `json:"transaction_id"`
+	ReleaseID     string `json:"release_id,omitempty"`
 	RemoteAddress string `json:"remote_address"`
 	RemotePort    int    `json:"remote_port"`
 	LocalAddress  string `json:"local_address"`
@@ -49,6 +50,7 @@ type logLegacyResponse struct {
 type logLegacyData struct {
 	Messages              []string           `json:"messages"`
 	ErrorMessages         []string           `json:"error_messages"`
+	ReleaseID             string             `json:"release_id,omitempty"`
 	Handler               string             `json:"handler"`
 	Stopwatch             logLegacyStopwatch `json:"stopwatch"`
 	ResponseBodyDechunked bool               `json:"response_body_dechunked"`

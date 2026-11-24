@@ -125,6 +125,11 @@ type Transaction struct {
 	// Contains a WAF instance for the current transaction
 	WAF *WAF
 
+	// release is the single immutable ruleset/redaction version observed by
+	// this transaction. It is captured once at creation and never replaced,
+	// giving phase-to-audit consistency across concurrent publishes.
+	release *Release
+
 	debugLogger debuglog.Logger
 
 	// Timestamp of the request
@@ -141,6 +146,22 @@ type Transaction struct {
 
 func (tx *Transaction) ID() string {
 	return tx.id
+}
+
+// evalRules evaluates the immutable release captured by this transaction.
+// Transactions without a published release retain the historical WAF RuleGroup
+// path used by direct construction and older integrations.
+func (tx *Transaction) evalRules(phase types.RulePhase) bool {
+	if tx.release != nil && tx.release.rules != nil {
+		return tx.release.rules.Eval(phase, tx)
+	}
+	return tx.WAF.Rules.Eval(phase, tx)
+}
+
+// Release returns the transaction's immutable release, or nil when versioned
+// releases are not enabled.
+func (tx *Transaction) Release() *Release {
+	return tx.release
 }
 
 func (tx *Transaction) Variables() plugintypes.TransactionVariables {
@@ -464,9 +485,16 @@ func (tx *Transaction) Capturing() bool {
 // that supports capture, like @rx
 func (tx *Transaction) CaptureField(index int, value string) {
 	if tx.Capture {
+		logValue := value
+		if tx.release != nil && tx.redactionMatcher() != nil {
+			// Capture substrings can be fragments of a sensitive field. The
+			// field selector is not available here, so versioned redaction
+			// avoids emitting the captured bytes to the debug sink.
+			logValue = tx.redactionMatcher().Replacement()
+		}
 		tx.debugLogger.Debug().
 			Int("field", index).
-			Str("value", value).
+			Str("value", logValue).
 			Msg("Capturing field")
 		i := strconv.Itoa(index)
 		tx.variables.tx.SetIndex(i, 0, value)
@@ -629,7 +657,11 @@ func (tx *Transaction) MatchRule(r *Rule, mds []types.MatchData) {
 
 	tx.matchedRules = append(tx.matchedRules, mr)
 	if tx.WAF.ErrorLogCb != nil && r.Log {
-		tx.WAF.ErrorLogCb(mr)
+		callbackRule := mr
+		if tx.release != nil {
+			callbackRule = tx.sanitizeMatchedRuleForOutput(mr, tx.collectSensitiveSecrets(tx.redactionMatcher()))
+		}
+		tx.WAF.ErrorLogCb(callbackRule)
 	}
 }
 
@@ -941,7 +973,7 @@ func (tx *Transaction) ProcessRequestHeaders() *types.Interruption {
 		return tx.interruption
 	}
 
-	tx.WAF.Rules.Eval(types.PhaseRequestHeaders, tx)
+	tx.evalRules(types.PhaseRequestHeaders)
 	return tx.interruption
 }
 
@@ -1126,7 +1158,7 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 
 	// we won't process empty request bodies or disabled RequestBodyAccess
 	if !tx.RequestBodyAccess || tx.requestBodyBuffer.length == 0 {
-		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
+		tx.evalRules(types.PhaseRequestBody)
 		return tx.interruption, nil
 	}
 	mimeType := ""
@@ -1157,13 +1189,13 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	rbp = strings.ToLower(rbp)
 	if rbp == "" {
 		// so there is no bodyprocessor, we don't want to generate an error
-		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
+		tx.evalRules(types.PhaseRequestBody)
 		return tx.interruption, nil
 	}
 	bodyprocessor, err := bodyprocessors.GetBodyProcessor(rbp)
 	if err != nil {
 		tx.generateRequestBodyError(errors.New("invalid body processor"))
-		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
+		tx.evalRules(types.PhaseRequestBody)
 		return tx.interruption, nil
 	}
 
@@ -1179,11 +1211,11 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 	}); err != nil {
 		tx.debugLogger.Error().Err(err).Msg("Failed to process request body")
 		tx.generateRequestBodyError(err)
-		tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
+		tx.evalRules(types.PhaseRequestBody)
 		return tx.interruption, nil
 	}
 
-	tx.WAF.Rules.Eval(types.PhaseRequestBody, tx)
+	tx.evalRules(types.PhaseRequestBody)
 	return tx.interruption, nil
 }
 
@@ -1213,7 +1245,7 @@ func (tx *Transaction) ProcessResponseHeaders(code int, proto string) *types.Int
 	tx.variables.responseStatus.Set(c)
 	tx.variables.responseProtocol.Set(proto)
 
-	tx.WAF.Rules.Eval(types.PhaseResponseHeaders, tx)
+	tx.evalRules(types.PhaseResponseHeaders)
 	return tx.interruption
 }
 
@@ -1387,7 +1419,7 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 		tx.debugLogger.Debug().
 			Bool("response_body_access", tx.ResponseBodyAccess).
 			Msg("Skipping response body processing")
-		tx.WAF.Rules.Eval(types.PhaseResponseBody, tx)
+		tx.evalRules(types.PhaseResponseBody)
 		return tx.interruption, nil
 	}
 
@@ -1400,7 +1432,7 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 		b, err := bodyprocessors.GetBodyProcessor(bp)
 		if err != nil {
 			tx.generateResponseBodyError(errors.New("invalid body processor"))
-			tx.WAF.Rules.Eval(types.PhaseResponseBody, tx)
+			tx.evalRules(types.PhaseResponseBody)
 			return tx.interruption, err
 		}
 
@@ -1421,7 +1453,7 @@ func (tx *Transaction) ProcessResponseBody() (*types.Interruption, error) {
 		tx.variables.responseContentLength.Set(strconv.FormatInt(length, 10))
 		tx.variables.responseBody.Set(buf.String())
 	}
-	tx.WAF.Rules.Eval(types.PhaseResponseBody, tx)
+	tx.evalRules(types.PhaseResponseBody)
 	return tx.interruption, nil
 }
 
@@ -1433,7 +1465,7 @@ func (tx *Transaction) ProcessLogging() {
 	// This avoids trying to rely on variables not set by previous rules that
 	// have not been executed
 	if !tx.IsRuleEngineOff() {
-		tx.WAF.Rules.Eval(types.PhaseLogging, tx)
+		tx.evalRules(types.PhaseLogging)
 	}
 
 	if tx.AuditEngine == types.AuditEngineOff {
@@ -1443,7 +1475,7 @@ func (tx *Transaction) ProcessLogging() {
 	}
 
 	if tx.AuditEngine == types.AuditEngineRelevantOnly {
-		re := tx.WAF.AuditLogRelevantStatus
+		re := tx.ConfigWAF().AuditLogRelevantStatus
 		status := tx.variables.responseStatus.Get()
 		if tx.IsInterrupted() {
 			status = strconv.Itoa(tx.interruption.Status)
@@ -1540,6 +1572,7 @@ func (tx *Transaction) LastPhase() types.RulePhase {
 func (tx *Transaction) AuditLog() *auditlog.Log {
 	al := &auditlog.Log{}
 	al.Parts_ = tx.AuditLogParts
+	cfgWAF := tx.ConfigWAF()
 
 	clientPort, _ := strconv.Atoi(tx.variables.remotePort.Get())
 	hostPort, _ := strconv.Atoi(tx.variables.serverPort.Get())
@@ -1561,6 +1594,7 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 	if highestSeverity == strconv.Itoa(defaultHighestSeverity) {
 		highestSeverity = ""
 	}
+	releaseSecrets := tx.collectSensitiveSecrets(tx.redactionMatcher())
 
 	// YYYY/MM/DD HH:mm:ss
 	ts := time.Unix(0, tx.Timestamp).Format("2006/01/02 15:04:05")
@@ -1619,12 +1653,12 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 		case types.AuditLogPartAuditLogTrailer:
 			auditLogPartAuditLogTrailerSet = true
 			al.Transaction_.Producer_ = &auditlog.TransactionProducer{
-				Connector_:  tx.WAF.ProducerConnector,
-				Version_:    tx.WAF.ProducerConnectorVersion,
+				Connector_:  cfgWAF.ProducerConnector,
+				Version_:    cfgWAF.ProducerConnectorVersion,
 				Server_:     "",
 				RuleEngine_: tx.RuleEngine.String(),
 				Stopwatch_:  tx.GetStopWatch(),
-				Rulesets_:   tx.WAF.ComponentNames,
+				Rulesets_:   cfgWAF.ComponentNames,
 			}
 		case types.AuditLogPartRulesMatched:
 			auditLogPartRulesMatchedSet = true
@@ -1637,10 +1671,11 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 				// - log,noauditlog: Log=true, Audit=false (error log only)
 				mrWithlog, ok := mr.(*corazarules.MatchedRule)
 				if ok && mrWithlog.Audit() {
+					safeMR := tx.sanitizeMatchedRuleForOutput(mrWithlog, releaseSecrets)
 					r := mr.Rule()
-					for _, matchData := range mr.MatchedDatas() {
+					for _, matchData := range safeMR.MatchedDatas() {
 						newAlEntry := auditlog.Message{
-							Actionset_: strings.Join(tx.WAF.ComponentNames, " "),
+							Actionset_: strings.Join(cfgWAF.ComponentNames, " "),
 							Message_:   matchData.Message(),
 							Data_: &auditlog.MessageData{
 								File_:     mr.Rule().File(),
@@ -1660,7 +1695,7 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 						// If AuditLogPartAuditLogTrailer (H) is set, we expect to log the error messages emitted by the rules
 						// in the audit log
 						if auditLogPartAuditLogTrailerSet {
-							newAlEntry.ErrorMessage_ = mr.ErrorLog()
+							newAlEntry.ErrorMessage_ = safeMR.ErrorLog()
 						}
 						al.Messages_ = append(al.Messages_, newAlEntry)
 					}
@@ -1675,15 +1710,16 @@ func (tx *Transaction) AuditLog() *auditlog.Log {
 		for _, mr := range tx.matchedRules {
 			mrWithlog, ok := mr.(*corazarules.MatchedRule)
 			if ok && mrWithlog.Audit() {
+				safeMR := tx.sanitizeMatchedRuleForOutput(mrWithlog, releaseSecrets)
 				al.Messages_ = append(al.Messages_, auditlog.Message{
-					ErrorMessage_: mr.ErrorLog(),
+					ErrorMessage_: safeMR.ErrorLog(),
 				})
 			}
 		}
 
 	}
 
-	return al
+	return tx.prepareVersionedAuditLog(al)
 }
 
 // auditLogCollectFiles collects uploaded file metadata from transaction variables
@@ -1722,12 +1758,13 @@ func (tx *Transaction) Close() error {
 	defer tx.WAF.txPool.Put(tx)
 
 	var errs []error
+	cfgWAF := tx.ConfigWAF()
 	if environment.HasAccessToFS {
 		// UploadKeepFilesRelevantOnly keeps temporary files only when there are
 		// log-relevant matched rules (i.e., rules that would be logged; rules
 		// with actions such as "nolog" are intentionally excluded here).
-		keepFiles := tx.WAF.UploadKeepFiles == types.UploadKeepFilesOn ||
-			(tx.WAF.UploadKeepFiles == types.UploadKeepFilesRelevantOnly && tx.hasLogRelevantMatchedRules())
+		keepFiles := cfgWAF.UploadKeepFiles == types.UploadKeepFilesOn ||
+			(cfgWAF.UploadKeepFiles == types.UploadKeepFilesRelevantOnly && tx.hasLogRelevantMatchedRules())
 
 		if !keepFiles {
 			// TODO(jcchavezs): filesTmpNames should probably be a new kind of collection that

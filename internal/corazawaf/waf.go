@@ -169,6 +169,12 @@ type WAF struct {
 	memoizerID uint64
 	memoizer   *memoize.Memoizer
 	closeOnce  gosync.Once
+
+	// Versioned releases are optional. When activeRelease is nil the WAF keeps
+	// its historical mutable RuleGroup behavior exactly.
+	activeRelease atomic.Value // *Release
+	releaseMu     gosync.Mutex
+	releaseSeq    uint64
 }
 
 // Options is used to pass options to the WAF instance
@@ -202,24 +208,33 @@ func (w *WAF) NewTransactionWithOptions(opts Options) *Transaction {
 // NewTransactionWithID Creates a new initialized transaction for this WAF instance
 // Using the specified ID
 func (w *WAF) newTransaction(opts Options) *Transaction {
+	// One constant-time atomic load fixes the release for the transaction's
+	// entire lifetime. No phase or audit write reloads the active pointer.
+	release := w.ActiveRelease()
+	cfg := w
+	if release != nil && release.compiledWAF != nil {
+		cfg = release.compiledWAF
+	}
+
 	tx := w.txPool.Get().(*Transaction)
 	tx.id = opts.ID
 	tx.context = opts.Context
+	tx.release = release
 	tx.matchedRules = []types.MatchedRule{}
 	tx.interruption = nil
 	tx.detectionOnlyInterruption = nil
 	tx.Logdata = "" // Deprecated, this variable is not used. Logdata for each matched rule is stored in the MatchData field.
 	tx.SkipAfter = ""
-	tx.AuditEngine = w.AuditEngine
-	tx.AuditLogParts = w.AuditLogParts
-	tx.AuditLogFormat = w.AuditLogFormat
+	tx.AuditEngine = cfg.AuditEngine
+	tx.AuditLogParts = cfg.AuditLogParts
+	tx.AuditLogFormat = cfg.AuditLogFormat
 	tx.ForceRequestBodyVariable = false
-	tx.RequestBodyAccess = w.RequestBodyAccess
-	tx.RequestBodyLimit = w.RequestBodyLimit
+	tx.RequestBodyAccess = cfg.RequestBodyAccess
+	tx.RequestBodyLimit = cfg.RequestBodyLimit
 	tx.ForceResponseBodyVariable = false
-	tx.ResponseBodyAccess = w.ResponseBodyAccess
-	tx.ResponseBodyLimit = w.ResponseBodyLimit
-	tx.RuleEngine = w.RuleEngine
+	tx.ResponseBodyAccess = cfg.ResponseBodyAccess
+	tx.ResponseBodyLimit = cfg.ResponseBodyLimit
+	tx.RuleEngine = cfg.RuleEngine
 	tx.HashEngine = false
 	tx.HashEnforcement = false
 	tx.lastPhase = 0
@@ -235,30 +250,37 @@ func (w *WAF) newTransaction(opts Options) *Transaction {
 	tx.Timestamp = time.Now().UnixNano()
 	tx.audit = false
 
+	requestBodyInMemoryLimit := cfg.RequestBodyLimit
+	if cfg.requestBodyInMemoryLimit != nil {
+		requestBodyInMemoryLimit = *cfg.requestBodyInMemoryLimit
+	}
 	// Always non-nil if buffers / collections were already initialized, so we don't do any of them
 	// based on the presence of RequestBodyBuffer.
 	if tx.requestBodyBuffer == nil {
-		// if no requestBodyInMemoryLimit has been set we default to the requestBodyLimit
-		requestBodyInMemoryLimit := w.RequestBodyLimit
-		if w.requestBodyInMemoryLimit != nil {
-			requestBodyInMemoryLimit = *w.requestBodyInMemoryLimit
-		}
-
 		tx.requestBodyBuffer = NewBodyBuffer(types.BodyBufferOptions{
-			TmpPath:     w.TmpDir,
+			TmpPath:     cfg.TmpDir,
 			MemoryLimit: requestBodyInMemoryLimit,
-			Limit:       w.RequestBodyLimit,
+			Limit:       tx.RequestBodyLimit,
 		})
 
 		tx.responseBodyBuffer = NewBodyBuffer(types.BodyBufferOptions{
-			TmpPath: w.TmpDir,
+			TmpPath: cfg.TmpDir,
 			// the response body is just buffered in memory. Therefore, Limit and MemoryLimit are equal.
-			MemoryLimit: w.ResponseBodyLimit,
-			Limit:       w.ResponseBodyLimit,
+			MemoryLimit: tx.ResponseBodyLimit,
+			Limit:       tx.ResponseBodyLimit,
 		})
 
 		tx.variables = *NewTransactionVariables()
 		tx.transformationCache = map[transformationKey]transformationValue{}
+	} else {
+		// Pooled transactions can outlive a release switch. Refresh only the
+		// immutable options; Reset/Close has already cleared buffer contents.
+		tx.requestBodyBuffer.options.TmpPath = cfg.TmpDir
+		tx.requestBodyBuffer.options.MemoryLimit = requestBodyInMemoryLimit
+		tx.requestBodyBuffer.options.Limit = tx.RequestBodyLimit
+		tx.responseBodyBuffer.options.TmpPath = cfg.TmpDir
+		tx.responseBodyBuffer.options.MemoryLimit = tx.ResponseBodyLimit
+		tx.responseBodyBuffer.options.Limit = tx.ResponseBodyLimit
 	}
 
 	// set capture variables

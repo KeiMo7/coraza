@@ -92,6 +92,37 @@ func main() {
 
 [Examples/http-server](./examples/http-server/) provides an example to practice with Coraza.
 
+### Atomic ruleset and redaction releases
+
+Runtime rule updates can opt into an immutable release surface without changing
+`NewWAF` or `NewTransaction`. A release bundles the complete SecLang content, a
+logical ruleset ID, a matching manifest/revision version, and a field-level
+redaction policy:
+
+```go
+rm, ok := coraza.AsReleaseManager(waf)
+info, err := rm.PublishRelease(coraza.ReleaseBundle{
+    RulesetID: "my-rules",
+    Version:   "2026-11-25",
+    Rules:     `SecRule REQUEST_HEADERS:X-Token "@rx ." "id:1001,phase:1,pass,log"`,
+    Redaction: &coraza.RedactionPolicy{
+        RulesetID: "my-rules",
+        Version:   "2026-11-25",
+        Fields: []coraza.RedactionField{{
+            Name:       "X-Token",
+            Containers: []coraza.RedactionContainer{coraza.RedactionHeaders},
+        }},
+    },
+})
+```
+
+Publishing compiles the candidate before the atomic pointer swap. Parse or
+manifest errors leave the previous release active. Each successful publish gets
+a monotonic `rN` identifier; transactions capture one release at creation and
+use it through rule evaluation and audit output. Audit records duplicate that
+identifier in the header, matched-rule data and trailer. When this surface is
+not used, audit output remains unchanged.
+
 ### Build tags
 
 Go build tags can tweak certain functionality at compile-time. These are for advanced use cases only and do not

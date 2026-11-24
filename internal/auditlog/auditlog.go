@@ -16,11 +16,74 @@ type Log struct {
 	// Parts contains the parts of the audit log
 	Parts_ types.AuditLogParts `json:"-"`
 
+	// Release_ is the immutable ruleset/redaction version that evaluated this
+	// transaction. It is omitted when versioned releases are not enabled.
+	Release_ *ReleaseInfo `json:"release,omitempty"`
+
 	// Transaction contains the transaction information
 	Transaction_ Transaction `json:"transaction"`
 
 	// Messages contains the triggered rules information
 	Messages_ []plugintypes.AuditLogMessage `json:"messages,omitempty"`
+}
+
+// ReleaseInfo identifies a versioned ruleset/redaction release in an audit
+// record. All sections of one record share the same ReleaseID.
+type ReleaseInfo struct {
+	// Sequence is the monotonic numeric release sequence.
+	Sequence uint64 `json:"sequence"`
+	// ID is the readable, never-reused release identifier ("r1", "r2", ...).
+	ID string `json:"id"`
+	// RulesetID is the logical ruleset name supplied with the bundle.
+	RulesetID string `json:"ruleset_id,omitempty"`
+	// Version is the paired caller-supplied ruleset/manifest version.
+	Version string `json:"version,omitempty"`
+}
+
+// ReleaseSequence returns the monotonic sequence number.
+func (r ReleaseInfo) ReleaseSequence() uint64 { return r.Sequence }
+
+// ReleaseID implements the optional plugintypes.AuditLogRelease interface.
+func (r ReleaseInfo) ReleaseID() string { return r.ID }
+
+// ReleaseRulesetID implements the optional plugintypes.AuditLogRelease interface.
+func (r ReleaseInfo) ReleaseRulesetID() string { return r.RulesetID }
+
+// ReleaseVersion implements the optional plugintypes.AuditLogRelease interface.
+func (r ReleaseInfo) ReleaseVersion() string { return r.Version }
+
+// Release returns the record-level release information.
+func (l *Log) Release() *ReleaseInfo { return l.Release_ }
+
+// ReleaseID implements releaseIDProvider.
+func (l *Log) ReleaseID() string {
+	if l == nil || l.Release_ == nil {
+		return ""
+	}
+	return l.Release_.ID
+}
+
+// ReleaseRulesetID returns the logical ruleset identifier.
+func (l *Log) ReleaseRulesetID() string {
+	if l == nil || l.Release_ == nil {
+		return ""
+	}
+	return l.Release_.RulesetID
+}
+
+// ReleaseVersion returns the paired source/manifest version.
+func (l *Log) ReleaseVersion() string {
+	if l == nil || l.Release_ == nil {
+		return ""
+	}
+	return l.Release_.Version
+}
+
+// AuditLogRelease is implemented by audit records that carry version metadata.
+type AuditLogRelease interface {
+	ReleaseID() string
+	ReleaseRulesetID() string
+	ReleaseVersion() string
 }
 
 func (l *Log) Parts() types.AuditLogParts {
@@ -75,6 +138,10 @@ type Transaction struct {
 	// Unique ID
 	ID_ string `json:"id"`
 
+	// Release_ is duplicated in the header so consumers can identify the
+	// decision version before parsing matched rules or the trailer.
+	Release_ *ReleaseInfo `json:"release,omitempty"`
+
 	// Client IP Address string representation
 	ClientIP_ string `json:"client_ip"`
 
@@ -101,6 +168,35 @@ func (t Transaction) UnixTimestamp() int64 {
 
 func (t Transaction) ID() string {
 	return t.ID_
+}
+
+// Release returns the versioned release metadata for this transaction header.
+func (t Transaction) Release() *ReleaseInfo {
+	return t.Release_
+}
+
+// ReleaseID implements AuditLogRelease.
+func (t Transaction) ReleaseID() string {
+	if t.Release_ == nil {
+		return ""
+	}
+	return t.Release_.ID
+}
+
+// ReleaseRulesetID implements AuditLogRelease.
+func (t Transaction) ReleaseRulesetID() string {
+	if t.Release_ == nil {
+		return ""
+	}
+	return t.Release_.RulesetID
+}
+
+// ReleaseVersion implements AuditLogRelease.
+func (t Transaction) ReleaseVersion() string {
+	if t.Release_ == nil {
+		return ""
+	}
+	return t.Release_.Version
 }
 
 func (t Transaction) ClientIP() string {
@@ -197,12 +293,13 @@ func (tr *TransactionResponse) Body() string {
 // TransactionProducer contains producer specific
 // information for debugging
 type TransactionProducer struct {
-	Connector_  string   `json:"connector"`
-	Version_    string   `json:"version"`
-	Server_     string   `json:"server"`
-	RuleEngine_ string   `json:"rule_engine"`
-	Stopwatch_  string   `json:"stopwatch"`
-	Rulesets_   []string `json:"rulesets"`
+	Connector_  string       `json:"connector"`
+	Version_    string       `json:"version"`
+	Server_     string       `json:"server"`
+	RuleEngine_ string       `json:"rule_engine"`
+	Stopwatch_  string       `json:"stopwatch"`
+	Rulesets_   []string     `json:"rulesets"`
+	Release_    *ReleaseInfo `json:"release,omitempty"`
 }
 
 var _ plugintypes.AuditLogTransactionProducer = (*TransactionProducer)(nil)
@@ -253,6 +350,30 @@ func (tp *TransactionProducer) Rulesets() []string {
 	}
 
 	return tp.Rulesets_
+}
+
+// ReleaseID returns the release identifier carried in the trailer.
+func (tp *TransactionProducer) ReleaseID() string {
+	if tp == nil || tp.Release_ == nil {
+		return ""
+	}
+	return tp.Release_.ID
+}
+
+// ReleaseRulesetID returns the logical ruleset identifier.
+func (tp *TransactionProducer) ReleaseRulesetID() string {
+	if tp == nil || tp.Release_ == nil {
+		return ""
+	}
+	return tp.Release_.RulesetID
+}
+
+// ReleaseVersion returns the paired source/manifest version.
+func (tp *TransactionProducer) ReleaseVersion() string {
+	if tp == nil || tp.Release_ == nil {
+		return ""
+	}
+	return tp.Release_.Version
 }
 
 // TransactionRequest contains request specific
@@ -366,6 +487,7 @@ type Message struct {
 	Actionset_    string       `json:"actionset"`
 	Message_      string       `json:"message"`
 	ErrorMessage_ string       `json:"error_message"`
+	Release_      *ReleaseInfo `json:"release,omitempty"`
 	Data_         *MessageData `json:"data"`
 }
 
@@ -387,6 +509,30 @@ func (m Message) Data() plugintypes.AuditLogMessageData {
 	return m.Data_
 }
 
+// ReleaseID identifies the release that produced this matched rule.
+func (m Message) ReleaseID() string {
+	if m.Release_ == nil {
+		return ""
+	}
+	return m.Release_.ID
+}
+
+// ReleaseRulesetID returns the logical ruleset identifier.
+func (m Message) ReleaseRulesetID() string {
+	if m.Release_ == nil {
+		return ""
+	}
+	return m.Release_.RulesetID
+}
+
+// ReleaseVersion returns the paired source/manifest version.
+func (m Message) ReleaseVersion() string {
+	if m.Release_ == nil {
+		return ""
+	}
+	return m.Release_.Version
+}
+
 // MessageData contains information about the triggered
 // rules in detail
 type MessageData struct {
@@ -402,6 +548,10 @@ type MessageData struct {
 	Accuracy_ int                `json:"accuracy"`
 	Tags_     []string           `json:"tags"`
 	Raw_      string             `json:"raw"`
+
+	// ReleaseID_ is the monotonic release identifier attached directly to the
+	// matched-rule data. It is additive and does not alter rule rev/ver fields.
+	ReleaseID_ string `json:"release_id,omitempty"`
 }
 
 var _ plugintypes.AuditLogMessageData = (*MessageData)(nil)
@@ -452,4 +602,12 @@ func (md *MessageData) Tags() []string {
 
 func (md *MessageData) Raw() string {
 	return md.Raw_
+}
+
+// ReleaseID returns the release identifier attached to this rule match.
+func (md *MessageData) ReleaseID() string {
+	if md == nil {
+		return ""
+	}
+	return md.ReleaseID_
 }

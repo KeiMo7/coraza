@@ -142,6 +142,33 @@ func (f ocsfFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 
 	}
 
+	metadata := &objects.Metadata{
+		CorrelationUid: "",
+		EventCode:      "",
+		//Labels:         [2]string{"", ""},
+		LogLevel: "",
+		LogName:  "",
+		//LogProvider: "OWASP Coraza Web Application Firewall",
+		LogProvider: al.Transaction().Producer().Connector(),
+		LogVersion:  al.Transaction().Producer().Version(),
+		LoggedTime:  time.Now().UnixMicro(),
+		Product: &objects.Product{
+			VendorName: "OWASP Coraza Web Application Firewall",
+		},
+		Version: "1.2.0",
+	}
+	if rel := auditReleaseID(al); rel != "" {
+		metadata.Labels = append(metadata.Labels, "coraza_release_id="+rel)
+		if p, ok := al.(AuditLogRelease); ok {
+			if p.ReleaseRulesetID() != "" {
+				metadata.Labels = append(metadata.Labels, "coraza_ruleset_id="+p.ReleaseRulesetID())
+			}
+			if p.ReleaseVersion() != "" {
+				metadata.Labels = append(metadata.Labels, "coraza_release_version="+p.ReleaseVersion())
+			}
+		}
+	}
+
 	// Populate the required fields for the WebRecourcesActivity
 	webResourcesActivity := application.WebResourcesActivity{
 		ActivityId:   enums.WEB_RESOURCES_ACTIVITY_ACTIVITY_ID_WEB_RESOURCES_ACTIVITY_ACTIVITY_ID_READ,
@@ -153,23 +180,9 @@ func (f ocsfFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 		Time:         al.Transaction().UnixTimestamp(),
 		ActionId:     ActionID,
 		Action:       Action,
-		Metadata: &objects.Metadata{
-			CorrelationUid: "",
-			EventCode:      "",
-			//Labels:         [2]string{"", ""},
-			LogLevel: "",
-			LogName:  "",
-			//LogProvider: "OWASP Coraza Web Application Firewall",
-			LogProvider: al.Transaction().Producer().Connector(),
-			LogVersion:  al.Transaction().Producer().Version(),
-			LoggedTime:  time.Now().UnixMicro(),
-			Product: &objects.Product{
-				VendorName: "OWASP Coraza Web Application Firewall",
-			},
-			Version: "1.2.0",
-		},
-		TypeUid:     enums.WEB_RESOURCES_ACTIVITY_TYPE_UID_WEB_RESOURCES_ACTIVITY_TYPE_UID_WEB_RESOURCES_ACTIVITY_READ,
-		Enrichments: f.getMatchDetails(al),
+		Metadata:     metadata,
+		TypeUid:      enums.WEB_RESOURCES_ACTIVITY_TYPE_UID_WEB_RESOURCES_ACTIVITY_TYPE_UID_WEB_RESOURCES_ACTIVITY_READ,
+		Enrichments:  f.getMatchDetails(al),
 		HttpRequest: &objects.HttpRequest{
 			Version:     al.Transaction().Request().Protocol(),
 			Args:        f.getRequestArguments(al),

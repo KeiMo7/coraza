@@ -285,11 +285,15 @@ func (r *Rule) doEvaluate(logger debuglog.Logger, phase types.RulePhase, tx *Tra
 
 				// args represents the transformed variables
 				for _, carg := range args[:argsLen] {
+					loggedArg := carg
+					if tx.release != nil && logger.Debug().IsEnabled() && tx.matchDataSensitive(arg) {
+						loggedArg = tx.redactionMatcher().Replacement()
+					}
 					evalLog := vLog.
 						Debug().
 						Str("operator_function", r.operator.Function).
 						Str("operator_data", r.operator.Data).
-						Str("arg", carg)
+						Str("arg", loggedArg)
 
 					match := r.executeOperator(carg, tx)
 					if match {
